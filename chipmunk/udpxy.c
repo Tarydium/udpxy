@@ -218,6 +218,7 @@ read_command( int sockfd, struct server_ctx *srv)
 
     TRACE( (void)tmfprintf( g_flog,  "Reading command from socket [%d]\n",
                             sockfd ) );
+usleep(50);  /* ..workaround VLC behavior: wait for receiving entire HTTP request, one packet per line */
     hlen = recv( sockfd, httpbuf, sizeof(httpbuf), 0 );
     if( 0>hlen ) {
         rc = errno;
@@ -244,6 +245,11 @@ read_command( int sockfd, struct server_ctx *srv)
 
     TRACE( (void)tmfprintf( g_flog, "Request=[%s], length=[%lu]\n",
                 request, (u_long)rlen ) );
+
+    rc = parse_auth( httpbuf, (size_t)hlen );
+    TRACE( (void)tmfprintf( g_flog, "Auth result=[%d]\n",
+                rc ) );
+    if (rc) return rc;
 
     (void) memset( &srv->rq, 0, sizeof(srv->rq) );
     rc = parse_param( request, rlen, srv->rq.cmd, sizeof(srv->rq.cmd),
@@ -310,6 +316,7 @@ send_http_response( int sockfd, int code, const char* reason)
     static char msg[ 3072 ];
     ssize_t nsent;
     a_socklen_t msglen;
+static const char CONTENT_TYPE[] = "Content-Type:application/octet-stream";
     int err = 0;
 
     assert( (sockfd > 0) && code && reason );
@@ -318,11 +325,11 @@ send_http_response( int sockfd, int code, const char* reason)
 
     if ((200 == code) && g_uopt.h200_ftr[0]) {
         msglen = snprintf( msg, sizeof(msg) - 1, "HTTP/1.1 %d %s\r\nServer: %s\r\n%s\r\n%s\r\n\r\n",
-            code, reason, g_app_info, g_uopt.cnt_type, g_uopt.h200_ftr);
+            code, reason, g_app_info, CONTENT_TYPE, g_uopt.h200_ftr);
     }
     else {
         msglen = snprintf( msg, sizeof(msg) - 1, "HTTP/1.1 %d %s\r\nServer: %s\r\n%s\r\n\r\n",
-                code, reason, g_app_info, g_uopt.cnt_type );
+                code, reason, g_app_info, CONTENT_TYPE );
     }
     if( msglen <= 0 ) return ERR_INTERNAL;
 
@@ -359,7 +366,7 @@ check_mcast_refresh( int msockfd, time_t* last_tm,
     assert( (msockfd > 0) && last_tm && mifaddr );
     now = time(NULL);
 
-    if( now - *last_tm >= g_uopt.mcast_refresh ) {
+     if( difftime( now, *last_tm ) >= g_uopt.mcast_refresh ) {
         (void) renew_multicast( msockfd, mifaddr );
         *last_tm = now;
     }
@@ -703,8 +710,8 @@ udp_relay( int sockfd, struct server_ctx* ctx )
     } while(0);
 
     if( 0 != rc ) {
-        (void) send_http_response( sockfd, 400, "Invalid address" );
-        return rc;
+     (void) send_http_response( sockfd, 500, "Service error" );
+          return rc;
     }
 
     /* start the (new) process to relay traffic */
@@ -827,9 +834,10 @@ report_status( int sockfd, const struct server_ctx* ctx, int options )
 {
     char *buf = NULL;
     int rc = 0;
-    ssize_t n = -1;
+    ssize_t n, nsent;
     size_t nlen = 0, bufsz, i;
     struct client_ctx *clc = NULL;
+
 
     enum {BLOCKING = 0, NON_BLOCKING = 1};
     enum {BYTES_HDR = 4096, BYTES_PER_CLI = 512};
@@ -854,12 +862,20 @@ report_status( int sockfd, const struct server_ctx* ctx, int options )
     nlen = bufsz;
     rc = mk_status_page( ctx, buf, &nlen, options | MSO_HTTP_HEADER );
 
+    for( n = nsent = 0; (0 == rc) && (nsent < (ssize_t)nlen);  ) {
+        errno = 0;
+
     (void) set_nblock(sockfd, BLOCKING);
         n = send( sockfd, buf, (int)nlen, 0 );
+
         if( (-1 == n) && (EINTR != errno) ) {
             mperror(g_flog, errno, "%s: send", __func__);
             rc = ERR_INTERNAL;
+			break;
         }
+		nsent += n;
+	}
+	
     (void) set_nblock(sockfd, NON_BLOCKING);
 
     if( 0 != rc ) {
@@ -1169,6 +1185,9 @@ usage( const char* app, FILE* fp )
             "\t-M : periodically renew multicast subscription (skip if 0 sec) [default = %d sec]\n",
             (long)DEFAULT_CACHE_LEN, g_uopt.rbuf_msgs, DHOLD_TIMEOUT, g_uopt.nice_incr,
             (int)g_uopt.mcast_refresh );
+    (void)fprintf(fp,
+            "\t-U : authfile (lines are in \"username:userpass\" format) [default = none]\n"
+            );
     (void) fprintf( fp, "Examples:\n"
             "  %s -p 4022 \n"
             "\tlisten for HTTP requests on port 4022, all network interfaces\n"
@@ -1200,9 +1219,9 @@ udpxy_main( int argc, char* const argv[] )
  * those features are experimental and for dev debugging ONLY
  * */
 #ifdef UDPXY_FILEIO
-    static const char UDPXY_OPTMASK[] = "TvSa:l:p:m:c:B:n:R:r:w:H:M:";
+    static const char UDPXY_OPTMASK[] = "TvSa:l:p:m:c:B:n:R:r:w:H:M:U:";
 #else
-    static const char UDPXY_OPTMASK[] = "TvSa:l:p:m:c:B:n:R:H:M:";
+    static const char UDPXY_OPTMASK[] = "TvSa:l:p:m:c:B:n:R:H:M:U:";
 #endif
 
     struct sigaction qact, iact, cact, oldact;
@@ -1271,6 +1290,17 @@ udpxy_main( int argc, char* const argv[] )
 
                       Setlinebuf( g_flog );
                       custom_log = 1;
+                      break;
+
+         case 'U':
+                      base64_init();
+                      rc = read_authfile(optarg);   /* ..fills valid_users[] */
+                      if (rc < 0) {
+                        (void) fprintf( stderr, "Error reading authfile "
+                                "[%s]: %d, %s\n",
+                                optarg, rc, strerror(errno) );
+                        rc = ERR_PARAM;
+                      }
                       break;
 
             case 'B':
