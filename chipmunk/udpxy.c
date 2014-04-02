@@ -57,6 +57,7 @@
 #include "uopt.h"
 #include "dpkt.h"
 #include "netop.h"
+#include "auth.h"
 
 /* external globals */
 
